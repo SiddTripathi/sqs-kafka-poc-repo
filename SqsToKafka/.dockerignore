@@ -1,0 +1,9 @@
+bin/
+obj/
+.vscode/
+.vs/
+*.user
+*.db
+*.pfx
+*.Secret.json
+docker-compose*
