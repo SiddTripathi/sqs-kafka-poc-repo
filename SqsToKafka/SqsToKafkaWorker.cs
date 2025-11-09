@@ -8,8 +8,8 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SqsToKafka.Options;
 using SqsToKafka.Services;
+using SqsToKafka.Services.Dedup;
 using System.Text.Json;
-using Microsoft.Extensions.Options;
 
 
 
@@ -23,21 +23,24 @@ public class SqsToKafkaWorker : BackgroundService
     private readonly SqsOptions _sqs;
     private readonly IKafkaProducer _producer;
     private readonly RoutingOptions _routing;
-    private readonly IDedupCache _dedupCache;
+    private readonly IDedupCache _dedup;
+    private readonly DedupOptions _dedupOpts;
     public SqsToKafkaWorker(
         ILogger<SqsToKafkaWorker> logger,
         IOptions<KafkaOptions> kafka,
         IOptions<SqsOptions> sqs,
         IKafkaProducer producer,
         IOptions<RoutingOptions> routing,
-        IDedupCache dedupCache)
+        IDedupCache dedup,
+        IOptions<DedupOptions> dedupOptions)
     {
         _logger = logger;
         _kafka = kafka.Value;
         _sqs = sqs.Value;
         _producer = producer;
         _routing = routing.Value;
-        _dedupCache = dedupCache;
+        _dedup = dedup;
+        _dedupOpts = dedupOptions.Value;
 
         _logger.LogInformation(
          string.IsNullOrWhiteSpace(_sqs.Profile)
@@ -136,7 +139,7 @@ public class SqsToKafkaWorker : BackgroundService
             else
             {
                 // Fallback: environment variables, container role, etc.
-                creds = FallbackCredentialsFactory.GetCredentials();
+                creds = Amazon.Runtime.FallbackCredentialsFactory.GetCredentials();
                 _logger.LogInformation("Using default AWS credential chain (env/metadata).");
             }
         
@@ -179,11 +182,12 @@ public class SqsToKafkaWorker : BackgroundService
                         {
                             _logger.LogInformation("Message ID: {Id} | Body: {Body}", msg.MessageId, msg.Body);
 
-                            if (_dedupCache.IsDuplicate(msg.MessageId))
-                            {
+                           /* 
+                            * if (_dedup.TryAcquire(msg.MessageId, TimeSpan.FromSeconds(_dedupOpts.TtlSeconds)))
+                            //{
                                 _logger.LogWarning("[Dedup] Duplicate message skipped: {Id}", msg.MessageId);
                                 continue;
-                            }
+                            //}
 
 
                             MessageAttributeValue topicAttr = null!;
@@ -203,18 +207,79 @@ public class SqsToKafkaWorker : BackgroundService
 
                             var (topic, key) = ResolveRouting(msg);
 
-                            // 1) Produce to Kafka
-                            var ok = await _producer.ProduceAsync(topic, key, msg.Body, stoppingToken);
+                            */
 
-                            // 2) Delete from SQS only on success
-                            if (ok)
+                            if (_dedupOpts.Enabled)
                             {
-                                _dedupCache.MarkProcessed(msg.MessageId);
-                                //await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
-                                _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", msg.MessageId);
+                                var ttl = TimeSpan.FromSeconds(_dedupOpts.TtlSeconds);
+                                if (!_dedup.TryAcquire(msg.MessageId, ttl))
+                                {
+                                    _logger.LogWarning("[Dedup] Duplicate message skipped: {MessageId}", msg.MessageId);
+                                    //await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                                    continue;
+                                }
                             }
-                            else
+
+                            var produced = false;
+                            try
                             {
+                                var (topic, key) = ResolveRouting(msg);
+                                // 1) Produce to Kafka
+                                produced = await _producer.ProduceAsync(topic, key, msg.Body, stoppingToken);
+
+                                if (produced)
+                                {
+                                    //_dedup.Release(msg.MessageId);
+                                    await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                                    _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", msg.MessageId);
+                                }
+                                else
+                                {
+                                    _logger.LogWarning("Kafka failed for message {Id}. Not deleting from SQS.", msg.MessageId);
+
+                                    // Allow retry: free the in-flight lock
+                                    if (_dedupOpts.Enabled) _dedup.Release(msg.MessageId);
+
+                                    // Optional back-off
+                                    var extendBySeconds = Math.Min(60, _sqs.VisibilityTimeoutSeconds);
+                                    try
+                                    {
+                                        await sqsClient.ChangeMessageVisibilityAsync(new ChangeMessageVisibilityRequest
+                                        {
+                                            QueueUrl = _sqs.QueueUrl,
+                                            ReceiptHandle = msg.ReceiptHandle,
+                                            VisibilityTimeout = extendBySeconds
+                                        }, stoppingToken);
+
+                                        var rc = (msg.Attributes != null &&
+                                                  msg.Attributes.TryGetValue("ApproximateReceiveCount", out var rcStr) &&
+                                                  int.TryParse(rcStr, out var r)) ? r : 1;
+
+                                        _logger.LogWarning(
+                                            "ReceiveCount={ReceiveCount}. Extended visibility by {Seconds}s for {Id}.",
+                                            rc, extendBySeconds, msg.MessageId);
+                                    }
+                                    catch (Exception ex2)
+                                    {
+                                        _logger.LogError(ex2, "Failed to extend visibility for {Id}.", msg.MessageId);
+                                    }
+
+
+
+                                }
+                            } 
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Error producing message {Id}.", msg.MessageId);
+                                if (_dedupOpts.Enabled) _dedup.Release(msg.MessageId);  // free lock on unexpected error
+                            }
+                            // 2) Delete from SQS only on success
+
+                            /*else
+                            {
+                                if (_dedupOpts.Enabled)
+                                    _dedup.Release(msg.MessageId);
+
                                 var receiveCount = msg.Attributes != null &&
                                                    msg.Attributes.TryGetValue("ApproximateReceiveCount", out var rcStr) &&
                                                    int.TryParse(rcStr, out var rc) ? rc : 1;
@@ -223,13 +288,15 @@ public class SqsToKafkaWorker : BackgroundService
                                 var extendBySeconds = Math.Min(60, _sqs.VisibilityTimeoutSeconds); // cap to your configured vis timeout
                                 try
                                 {
+                                    if (!ok && _dedupOpts.Enabled)
+                                        _dedup.Release(msg.MessageId);
                                     await sqsClient.ChangeMessageVisibilityAsync(new ChangeMessageVisibilityRequest
                                     {
                                         QueueUrl = _sqs.QueueUrl,
                                         ReceiptHandle = msg.ReceiptHandle,
                                         VisibilityTimeout = extendBySeconds
                                     }, stoppingToken);
-
+                                   
                                     _logger.LogWarning(
                                         "Kafka failed for message {Id}. Not deleting from SQS. ReceiveCount={ReceiveCount}. Extended visibility by {Seconds}s.",
                                         msg.MessageId, receiveCount, extendBySeconds);
@@ -242,7 +309,7 @@ public class SqsToKafkaWorker : BackgroundService
                                 }
 
                                 // (We’ll add retries / DLQ handling next.)
-                            }
+                            }*/
 
                         }
                     }
