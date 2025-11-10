@@ -25,6 +25,8 @@ public class SqsToKafkaWorker : BackgroundService
     private readonly RoutingOptions _routing;
     private readonly IDedupCache _dedup;
     private readonly DedupOptions _dedupOpts;
+    private readonly IDedupStore _dedupStore;
+
     public SqsToKafkaWorker(
         ILogger<SqsToKafkaWorker> logger,
         IOptions<KafkaOptions> kafka,
@@ -32,7 +34,8 @@ public class SqsToKafkaWorker : BackgroundService
         IKafkaProducer producer,
         IOptions<RoutingOptions> routing,
         IDedupCache dedup,
-        IOptions<DedupOptions> dedupOptions)
+        IOptions<DedupOptions> dedupOptions,
+        IDedupStore dedupStore)
     {
         _logger = logger;
         _kafka = kafka.Value;
@@ -41,6 +44,7 @@ public class SqsToKafkaWorker : BackgroundService
         _routing = routing.Value;
         _dedup = dedup;
         _dedupOpts = dedupOptions.Value;
+        _dedupStore = dedupStore;
 
         _logger.LogInformation(
          string.IsNullOrWhiteSpace(_sqs.Profile)
@@ -182,32 +186,42 @@ public class SqsToKafkaWorker : BackgroundService
                         {
                             _logger.LogInformation("Message ID: {Id} | Body: {Body}", msg.MessageId, msg.Body);
 
-                           /* 
-                            * if (_dedup.TryAcquire(msg.MessageId, TimeSpan.FromSeconds(_dedupOpts.TtlSeconds)))
-                            //{
-                                _logger.LogWarning("[Dedup] Duplicate message skipped: {Id}", msg.MessageId);
-                                continue;
-                            //}
+                            /* 
+                             * if (_dedup.TryAcquire(msg.MessageId, TimeSpan.FromSeconds(_dedupOpts.TtlSeconds)))
+                             //{
+                                 _logger.LogWarning("[Dedup] Duplicate message skipped: {Id}", msg.MessageId);
+                                 continue;
+                             //}
 
 
-                            MessageAttributeValue topicAttr = null!;
-                            MessageAttributeValue keyAttr = null!;
+                             MessageAttributeValue topicAttr = null!;
+                             MessageAttributeValue keyAttr = null!;
 
-                            if (msg.MessageAttributes != null)
+                             if (msg.MessageAttributes != null)
+                             {
+                                 msg.MessageAttributes.TryGetValue("KafkaTopic", out topicAttr);
+                                 msg.MessageAttributes.TryGetValue("KafkaKey", out keyAttr);
+                             }
+
+                             var topic1 = string.IsNullOrWhiteSpace(topicAttr?.StringValue)
+                                 ? _kafka.DefaultTopic
+                                 : topicAttr.StringValue;
+
+                             var key1 = keyAttr?.StringValue;
+
+                             var (topic, key) = ResolveRouting(msg);
+
+                             */
+
+                            if (await _dedupStore.SeenBeforeAsync(msg.MessageId, stoppingToken))
                             {
-                                msg.MessageAttributes.TryGetValue("KafkaTopic", out topicAttr);
-                                msg.MessageAttributes.TryGetValue("KafkaKey", out keyAttr);
+                                _logger.LogWarning("[Dedup:SQL] Already processed MessageId={MessageId} — skipping.", msg.MessageId);
+                                // Do NOT delete from SQS here; let redrive/visibility policies handle it if needed.
+                                // If you WANT to delete already-seen messages, uncomment:
+                                // await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                                continue;
                             }
 
-                            var topic1 = string.IsNullOrWhiteSpace(topicAttr?.StringValue)
-                                ? _kafka.DefaultTopic
-                                : topicAttr.StringValue;
-
-                            var key1 = keyAttr?.StringValue;
-
-                            var (topic, key) = ResolveRouting(msg);
-
-                            */
 
                             if (_dedupOpts.Enabled)
                             {
@@ -232,6 +246,7 @@ public class SqsToKafkaWorker : BackgroundService
                                     //_dedup.Release(msg.MessageId);
                                     await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
                                     _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", msg.MessageId);
+                                    await _dedupStore.MarkProcessedAsync(msg.MessageId, DateTimeOffset.UtcNow, stoppingToken);
                                 }
                                 else
                                 {

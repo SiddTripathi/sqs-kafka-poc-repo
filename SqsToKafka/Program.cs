@@ -1,11 +1,9 @@
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using SqsToKafka;
 using SqsToKafka.Options;
 using SqsToKafka.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;                 // ValidateOnStart
-using SqsToKafka.Options;
 using SqsToKafka.Services.Dedup;
 
 
@@ -36,21 +34,22 @@ Host.CreateDefaultBuilder(args)
                 .Bind(cfg.GetSection("dedup"))
                 .ValidateDataAnnotations()
                 .ValidateOnStart();
-        
+        services.AddOptions<DedupSqlOptions>()
+                .Bind(cfg.GetSection("DedupSql"))
+                .ValidateOnStart();
+
         // --- Services ----
         services.AddHostedService<SqsToKafkaWorker>();
         services.AddSingleton<IKafkaProducer, KafkaProducer>();
         services.AddSingleton<IDedupCache, InMemoryDedupCache>();
-       /* var dedupMode = cfg.GetValue<string>("dedup:mode")?.ToLowerInvariant() ?? "memory";
-        if (dedupMode == "sql")
+        services.AddSingleton<IDedupStore>(sp =>
         {
-            services.AddSingleton<IDedupCache, SqlDedupCache>();
-        }
-        else
-        {
-            services.AddSingleton<IDedupCache, InMemoryDedupCache>();
-        }
-       */
+            var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<DedupSqlOptions>>().Value;
+            if (o.Enabled && !string.IsNullOrWhiteSpace(o.ConnectionString))
+                return new SqlDedupStore(o.ConnectionString!, o.TtlDays);
+
+            return new NoopDedupStore();
+        });
 
 
     })
