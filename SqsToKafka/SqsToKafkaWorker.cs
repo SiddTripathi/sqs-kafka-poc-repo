@@ -185,6 +185,32 @@ public class SqsToKafkaWorker : BackgroundService
                         foreach (var msg in response.Messages)
                         {
                             _logger.LogInformation("Message ID: {Id} | Body: {Body}", msg.MessageId, msg.Body);
+                            // Compute the dedup ID: prefer attribute/body "DedupId", else SQS MessageId
+                            string dedupId = msg.MessageId;
+
+                            // 1) Attribute: DedupId -- This is only to test the in memory and sql dedup logic. In actual scenario the sqs msg id will be used.
+                            if (msg.MessageAttributes != null &&
+                                msg.MessageAttributes.TryGetValue("DedupId", out var didAttr) &&
+                                !string.IsNullOrWhiteSpace(didAttr.StringValue))
+                            {
+                                dedupId = didAttr.StringValue!;
+                            }
+                            else
+                            {
+                                // 2) Body JSON: { "DedupId": "..." }
+                                try
+                                {
+                                    using var doc2 = JsonDocument.Parse(msg.Body);
+                                    if (doc2.RootElement.ValueKind == JsonValueKind.Object &&
+                                        doc2.RootElement.TryGetProperty("DedupId", out var didBody) &&
+                                        didBody.ValueKind == JsonValueKind.String)
+                                    {
+                                        var val = didBody.GetString();
+                                        if (!string.IsNullOrWhiteSpace(val)) dedupId = val!;
+                                    }
+                                }
+                                catch { /* non-JSON or missing — ignore */ }
+                            }
 
                             /* 
                              * if (_dedup.TryAcquire(msg.MessageId, TimeSpan.FromSeconds(_dedupOpts.TtlSeconds)))
@@ -213,9 +239,9 @@ public class SqsToKafkaWorker : BackgroundService
 
                              */
 
-                            if (await _dedupStore.SeenBeforeAsync(msg.MessageId, stoppingToken))
+                            if (await _dedupStore.SeenBeforeAsync(dedupId, stoppingToken))
                             {
-                                _logger.LogWarning("[Dedup:SQL] Already processed MessageId={MessageId} — skipping.", msg.MessageId);
+                                _logger.LogWarning("[Dedup:SQL] Already processed DedupId={DedupId} — deleting redelivery.", dedupId);
                                 // Do NOT delete from SQS here; let redrive/visibility policies handle it if needed.
                                 // If you WANT to delete already-seen messages, uncomment:
                                 // await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
@@ -226,9 +252,9 @@ public class SqsToKafkaWorker : BackgroundService
                             if (_dedupOpts.Enabled)
                             {
                                 var ttl = TimeSpan.FromSeconds(_dedupOpts.TtlSeconds);
-                                if (!_dedup.TryAcquire(msg.MessageId, ttl))
+                                if (!_dedup.TryAcquire(dedupId, ttl))
                                 {
-                                    _logger.LogWarning("[Dedup] Duplicate message skipped: {MessageId}", msg.MessageId);
+                                    _logger.LogWarning("[Dedup] Duplicate message skipped: {MessageId}", dedupId);
                                     //await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
                                     continue;
                                 }
@@ -245,15 +271,15 @@ public class SqsToKafkaWorker : BackgroundService
                                 {
                                     //_dedup.Release(msg.MessageId);
                                     await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
-                                    _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", msg.MessageId);
-                                    await _dedupStore.MarkProcessedAsync(msg.MessageId, DateTimeOffset.UtcNow, stoppingToken);
+                                    _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", dedupId);
+                                    await _dedupStore.MarkProcessedAsync(dedupId, DateTimeOffset.UtcNow, stoppingToken);
                                 }
                                 else
                                 {
-                                    _logger.LogWarning("Kafka failed for message {Id}. Not deleting from SQS.", msg.MessageId);
+                                    _logger.LogWarning("Kafka failed for message {Id}. Not deleting from SQS.", dedupId);
 
                                     // Allow retry: free the in-flight lock
-                                    if (_dedupOpts.Enabled) _dedup.Release(msg.MessageId);
+                                    if (_dedupOpts.Enabled) _dedup.Release(dedupId);
 
                                     // Optional back-off
                                     var extendBySeconds = Math.Min(60, _sqs.VisibilityTimeoutSeconds);
@@ -285,8 +311,8 @@ public class SqsToKafkaWorker : BackgroundService
                             } 
                             catch (Exception ex)
                             {
-                                _logger.LogError(ex, "Error producing message {Id}.", msg.MessageId);
-                                if (_dedupOpts.Enabled) _dedup.Release(msg.MessageId);  // free lock on unexpected error
+                                _logger.LogError(ex, "Error producing message {Id}.", dedupId);
+                                if (_dedupOpts.Enabled) _dedup.Release(dedupId);  // free lock on unexpected error
                             }
                             // 2) Delete from SQS only on success
 
