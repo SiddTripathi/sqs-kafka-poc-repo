@@ -1,4 +1,4 @@
-using Amazon;
+ï»¿using Amazon;
 using Amazon.Runtime;
 using Amazon.Runtime.CredentialManagement;
 using Amazon.SQS;
@@ -26,6 +26,10 @@ public class SqsToKafkaWorker : BackgroundService
     private readonly IDedupCache _dedup;
     private readonly DedupOptions _dedupOpts;
     private readonly IDedupStore _dedupStore;
+    private readonly RetryOptions _retry;
+    private readonly VisibilityOptions _vis;
+    private readonly DeadLetterOptions _dlq;
+
 
     public SqsToKafkaWorker(
         ILogger<SqsToKafkaWorker> logger,
@@ -35,7 +39,10 @@ public class SqsToKafkaWorker : BackgroundService
         IOptions<RoutingOptions> routing,
         IDedupCache dedup,
         IOptions<DedupOptions> dedupOptions,
-        IDedupStore dedupStore)
+        IDedupStore dedupStore,
+        IOptions<RetryOptions> retry,
+        IOptions<VisibilityOptions> vis,
+        IOptions<DeadLetterOptions> dlq)
     {
         _logger = logger;
         _kafka = kafka.Value;
@@ -45,10 +52,14 @@ public class SqsToKafkaWorker : BackgroundService
         _dedup = dedup;
         _dedupOpts = dedupOptions.Value;
         _dedupStore = dedupStore;
+        _retry = retry.Value;
+        _vis = vis.Value;
+        _dlq = dlq.Value;
+
 
         _logger.LogInformation(
          string.IsNullOrWhiteSpace(_sqs.Profile)
-             ? "No AWS profile set — will use environment credentials."
+             ? "No AWS profile set â€” will use environment credentials."
              : $"Using AWS profile: {_sqs.Profile}"
          );
 
@@ -116,6 +127,70 @@ public class SqsToKafkaWorker : BackgroundService
 
         return (string.IsNullOrWhiteSpace(topic) ? _kafka.DefaultTopic : topic, key);
     }
+
+    private TimeSpan ComputeBackoff(int attempt)
+    {
+        // attempt is 1-based (1,2,3...)
+        var cap = Math.Min(_retry.MaxDelayMs, _retry.BaseDelayMs * (int)Math.Pow(2, attempt - 1));
+        if (_retry.Jitter)
+        {
+            var jitter = Random.Shared.Next(0, (int)(cap * 0.2)); // up to +20%
+            cap += jitter;
+        }
+        return TimeSpan.FromMilliseconds(cap);
+    }
+
+    private sealed class CancellationDisposable : IDisposable
+    {
+        private readonly CancellationTokenSource _cts;
+        public CancellationDisposable(CancellationTokenSource cts) => _cts = cts;
+        public void Dispose() => _cts.Cancel();
+    }
+
+    private IDisposable StartVisibilityAutoExtend(AmazonSQSClient client, string queueUrl, string receiptHandle, CancellationToken parent)
+    {
+        // If disabled, return a no-op disposable
+        if (!_vis.AutoExtend) return new CancellationDisposable(new CancellationTokenSource(0));
+
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(parent);
+        var step = TimeSpan.FromSeconds(Math.Max(5, _vis.StepSeconds));
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(Math.Max(_vis.StepSeconds, _vis.MaxPerMessageSeconds));
+
+        _ = Task.Run(async () =>
+        {
+            while (!cts.Token.IsCancellationRequested && DateTimeOffset.UtcNow < deadline)
+            {
+                try
+                {
+                    await Task.Delay(step, cts.Token);
+
+                    // Renew to slightly longer than the step so we always stay ahead
+                    var newTimeout = (int)Math.Min(_sqs.VisibilityTimeoutSeconds, step.TotalSeconds + 10);
+
+                    await client.ChangeMessageVisibilityAsync(new ChangeMessageVisibilityRequest
+                    {
+                        QueueUrl = queueUrl,
+                        ReceiptHandle = receiptHandle,
+                        VisibilityTimeout = newTimeout
+                    }, cts.Token);
+
+                    _logger.LogDebug("Auto-extended SQS visibility by ~{Seconds}s for DedupId/Msg: {Id}",
+                        newTimeout, receiptHandle);
+                }
+                catch (OperationCanceledException) { /* stopping */ }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Auto-extend failed for receiptHandle={Receipt}", receiptHandle);
+                }
+            }
+        }, cts.Token);
+
+        return new CancellationDisposable(cts);
+    }
+
+
+
+
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -209,7 +284,7 @@ public class SqsToKafkaWorker : BackgroundService
                                         if (!string.IsNullOrWhiteSpace(val)) dedupId = val!;
                                     }
                                 }
-                                catch { /* non-JSON or missing — ignore */ }
+                                catch { /* non-JSON or missing â€” ignore */ }
                             }
 
                             /* 
@@ -241,10 +316,10 @@ public class SqsToKafkaWorker : BackgroundService
 
                             if (await _dedupStore.SeenBeforeAsync(dedupId, stoppingToken))
                             {
-                                _logger.LogWarning("[Dedup:SQL] Already processed DedupId={DedupId} — deleting redelivery.", dedupId);
+                                _logger.LogWarning("[Dedup:SQL] Already processed DedupId={DedupId} â€” deleting redelivery.", dedupId);
                                 // Do NOT delete from SQS here; let redrive/visibility policies handle it if needed.
-                                // If you WANT to delete already-seen messages, uncomment:
-                                // await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                                // If you do not WANT to delete already-seen messages, comment:
+                                await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
                                 continue;
                             }
 
@@ -254,66 +329,152 @@ public class SqsToKafkaWorker : BackgroundService
                                 var ttl = TimeSpan.FromSeconds(_dedupOpts.TtlSeconds);
                                 if (!_dedup.TryAcquire(dedupId, ttl))
                                 {
-                                    _logger.LogWarning("[Dedup] Duplicate message skipped: {MessageId}", dedupId);
+                                    _logger.LogWarning("[Dedup] Duplicate message skipped: {DedupId}", dedupId);
                                     //await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
                                     continue;
                                 }
                             }
-
+                            var (topic, key) = ResolveRouting(msg);
+                            var attempt = 0;
+                            //Exception? lastError = null;
                             var produced = false;
-                            try
-                            {
-                                var (topic, key) = ResolveRouting(msg);
-                                // 1) Produce to Kafka
-                                produced = await _producer.ProduceAsync(topic, key, msg.Body, stoppingToken);
+                            // Start auto-renewal of visibility while processing this message
+                            using var visLease = StartVisibilityAutoExtend(sqsClient, _sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                            //The below line is for test only to test the extended visibility feature. 
+                            //await Task.Delay(TimeSpan.FromSeconds(90), stoppingToken);
 
-                                if (produced)
+                            while (attempt < _retry.MaxProduceAttempts && !stoppingToken.IsCancellationRequested)
+                            {
+                                attempt++;
+                                try
                                 {
-                                    //_dedup.Release(msg.MessageId);
-                                    await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
-                                    _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", dedupId);
-                                    await _dedupStore.MarkProcessedAsync(dedupId, DateTimeOffset.UtcNow, stoppingToken);
+                                    // 1) Produce to Kafka
+                                    produced = await _producer.ProduceAsync(topic, key, msg.Body, stoppingToken);
+
+                                    if (produced)
+                                    {
+                                        //_dedup.Release(msg.MessageId);
+                                        if (attempt > 1)
+                                            _logger.LogInformation("Produce succeeded on attempt {Attempt} for {DedupId}.", attempt, dedupId);
+                                        await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                                        _logger.LogInformation("Deleted message {Id} from SQS after Kafka ack.", dedupId);
+                                        await _dedupStore.MarkProcessedAsync(dedupId, DateTimeOffset.UtcNow, stoppingToken);
+                                        break;
+                                        
+                                    }
+                                    else
+                                    {
+                                        _logger.LogWarning("Kafka failed for message {Id}. Not deleting from SQS.", dedupId);
+
+                                        // Allow retry: free the in-flight lock
+                                        if (_dedupOpts.Enabled) _dedup.Release(dedupId);
+
+                                        // Optional back-off
+                                        var extendBySeconds = Math.Min(60, _sqs.VisibilityTimeoutSeconds);
+                                        try
+                                        {
+                                            await sqsClient.ChangeMessageVisibilityAsync(new ChangeMessageVisibilityRequest
+                                            {
+                                                QueueUrl = _sqs.QueueUrl,
+                                                ReceiptHandle = msg.ReceiptHandle,
+                                                VisibilityTimeout = extendBySeconds
+                                            }, stoppingToken);
+
+                                            var rc = (msg.Attributes != null &&
+                                                      msg.Attributes.TryGetValue("ApproximateReceiveCount", out var rcStr) &&
+                                                      int.TryParse(rcStr, out var r)) ? r : 1;
+
+                                            _logger.LogWarning(
+                                                "ReceiveCount={ReceiveCount}. Extended visibility by {Seconds}s for {Id}.",
+                                                rc, extendBySeconds, dedupId);
+                                        }
+                                        catch (Exception ex2)
+                                        {
+                                            _logger.LogError(ex2, "Failed to extend visibility for {Id}.", dedupId);
+                                        }
+                                        var delay = ComputeBackoff(attempt);
+                                        _logger.LogWarning("Produce returned false (attempt {Attempt}/{Max}). Backing off {Delay}â€¦ DedupId={DedupId}",
+                                            attempt, _retry.MaxProduceAttempts, delay, dedupId);
+                                        await Task.Delay(delay, stoppingToken);
+
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogError(ex, "Error producing message {Id}.", dedupId);
+                                    if (_dedupOpts.Enabled) _dedup.Release(dedupId);  // free lock on unexpected error
+                                    var delay = ComputeBackoff(attempt);
+                                    _logger.LogWarning(ex, "Produce failed (attempt {Attempt}/{Max}). Backing off {Delay}â€¦ DedupId={DedupId}",
+                                        attempt, _retry.MaxProduceAttempts, delay, dedupId);
+
+                                    await Task.Delay(delay, stoppingToken);
+                                }
+
+                            }
+                            if (!produced && !stoppingToken.IsCancellationRequested)
+                            {
+                                // 1) Try to publish a DLQ event (if enabled)
+                                if (_dlq.Enabled)
+                                {
+                                    try
+                                    {
+                                        // Build DLQ payload (include original context safely)
+                                        var dlqPayload = new
+                                        {
+                                            reason = "max_attempts_exceeded",
+                                            attempts = _retry.MaxProduceAttempts,
+                                            original = new
+                                            {
+                                                dedupId,
+                                                sqsMessageId = msg.MessageId,
+                                                topic = topic,
+                                                key = key,
+                                                // optionally include body/attributes based on options
+                                                body = _dlq.IncludeBody ? msg.Body : null,
+                                                attributes = _dlq.IncludeAttributes ? msg.MessageAttributes : null
+                                            },
+                                            failedAtUtc = DateTimeOffset.UtcNow
+                                        };
+
+                                        var dlqJson = JsonSerializer.Serialize(dlqPayload);
+
+                                        // NOTE: we use the same key (if any) so DLQ can be partition-aware
+                                        var dlqOk = await _producer.ProduceAsync(_dlq.Topic, key, dlqJson, stoppingToken);
+
+                                        if (dlqOk)
+                                        {
+                                            _logger.LogError("Published to DLQ topic {Topic} for DedupId={DedupId} after {Attempts} attempts.",
+                                                _dlq.Topic, dedupId, _retry.MaxProduceAttempts);
+
+                                            // 2) Since DLQ captured it, delete from SQS to stop infinite redrives
+                                            await sqsClient.DeleteMessageAsync(_sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
+                                            _logger.LogWarning("Deleted message from SQS after DLQ handoff. DedupId={DedupId}", dedupId);
+                                        }
+                                        else
+                                        {
+                                            _logger.LogError("Failed to publish to DLQ topic {Topic}. Leaving message for SQS redrive. DedupId={DedupId}",
+                                                _dlq.Topic, dedupId);
+                                            // do NOT delete from SQS; let SQS redrive (and SQS DLQ) handle it
+                                        }
+                                    }
+                                    catch (Exception exDlq)
+                                    {
+                                        _logger.LogError(exDlq, "DLQ publish threw an exception. Leaving message for SQS redrive. DedupId={DedupId}",
+                                            dedupId);
+                                        // do NOT delete from SQS; let SQS redrive (and SQS DLQ) handle it
+                                    }
                                 }
                                 else
                                 {
-                                    _logger.LogWarning("Kafka failed for message {Id}. Not deleting from SQS.", dedupId);
-
-                                    // Allow retry: free the in-flight lock
-                                    if (_dedupOpts.Enabled) _dedup.Release(dedupId);
-
-                                    // Optional back-off
-                                    var extendBySeconds = Math.Min(60, _sqs.VisibilityTimeoutSeconds);
-                                    try
-                                    {
-                                        await sqsClient.ChangeMessageVisibilityAsync(new ChangeMessageVisibilityRequest
-                                        {
-                                            QueueUrl = _sqs.QueueUrl,
-                                            ReceiptHandle = msg.ReceiptHandle,
-                                            VisibilityTimeout = extendBySeconds
-                                        }, stoppingToken);
-
-                                        var rc = (msg.Attributes != null &&
-                                                  msg.Attributes.TryGetValue("ApproximateReceiveCount", out var rcStr) &&
-                                                  int.TryParse(rcStr, out var r)) ? r : 1;
-
-                                        _logger.LogWarning(
-                                            "ReceiveCount={ReceiveCount}. Extended visibility by {Seconds}s for {Id}.",
-                                            rc, extendBySeconds, msg.MessageId);
-                                    }
-                                    catch (Exception ex2)
-                                    {
-                                        _logger.LogError(ex2, "Failed to extend visibility for {Id}.", msg.MessageId);
-                                    }
-
-
-
+                                    // DLQ disabled â†’ leave message for SQS redrive / SQS DLQ
+                                    _logger.LogError("Produce failed after {Max} attempts for {DedupId}. DLQ disabled â€” leaving for SQS redrive.",
+                                        _retry.MaxProduceAttempts, dedupId);
                                 }
-                            } 
-                            catch (Exception ex)
-                            {
-                                _logger.LogError(ex, "Error producing message {Id}.", dedupId);
-                                if (_dedupOpts.Enabled) _dedup.Release(dedupId);  // free lock on unexpected error
+
+                                // End processing this message
+                                continue;
                             }
+
                             // 2) Delete from SQS only on success
 
                             /*else
@@ -325,7 +486,7 @@ public class SqsToKafkaWorker : BackgroundService
                                                    msg.Attributes.TryGetValue("ApproximateReceiveCount", out var rcStr) &&
                                                    int.TryParse(rcStr, out var rc) ? rc : 1;
 
-                                // Extend visibility so it won’t reappear immediately while Kafka is recovering.
+                                // Extend visibility so it wonâ€™t reappear immediately while Kafka is recovering.
                                 var extendBySeconds = Math.Min(60, _sqs.VisibilityTimeoutSeconds); // cap to your configured vis timeout
                                 try
                                 {
@@ -349,7 +510,7 @@ public class SqsToKafkaWorker : BackgroundService
                                         msg.MessageId, receiveCount);
                                 }
 
-                                // (We’ll add retries / DLQ handling next.)
+                                // (Weâ€™ll add retries / DLQ handling next.)
                             }*/
 
                         }
@@ -377,7 +538,7 @@ public class SqsToKafkaWorker : BackgroundService
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Stopping worker… flushing Kafka producer.");
+        _logger.LogInformation("Stopping workerâ€¦ flushing Kafka producer.");
         try
         {
             await _producer.DisposeAsync(); // your IKafkaProducer flushes & disposes

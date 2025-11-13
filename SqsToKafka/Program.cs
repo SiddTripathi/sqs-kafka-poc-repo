@@ -37,6 +37,16 @@ Host.CreateDefaultBuilder(args)
         services.AddOptions<DedupSqlOptions>()
                 .Bind(cfg.GetSection("DedupSql"))
                 .ValidateOnStart();
+        services.AddOptions<RetryOptions>()
+                .Bind(cfg.GetSection("Retry"))
+                .ValidateDataAnnotations()
+                .ValidateOnStart();
+        services.AddOptions<VisibilityOptions>()
+                .Bind(cfg.GetSection("Visibility"))
+                .ValidateOnStart();
+        services.AddOptions<DeadLetterOptions>()
+                .Bind(cfg.GetSection("DeadLetter"))
+                .ValidateOnStart();
 
         // --- Services ----
         services.AddHostedService<SqsToKafkaWorker>();
