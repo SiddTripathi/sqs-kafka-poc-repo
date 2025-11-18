@@ -10,62 +10,58 @@ pool:
 variables:
   imageName: 'sqs-to-kafka'
   dockerfilePath: 'SqsToKafka/Dockerfile'
-  projectPath: 'SqsToKafka'
+  solutionPath: 'SqsToKafka.sln'
   buildConfiguration: 'Release'
 
 steps:
-  # 1) Checkout
-  - task: Checkout@1
-    displayName: 'Checkout code'
-    inputs:
-      clean: true
+  # (Implicit) checkout happens automatically – no Checkout task needed
 
-  # 2) Install .NET SDK
+  # 1) Install .NET SDK
   - task: UseDotNet@2
     displayName: 'Install .NET SDK'
     inputs:
       packageType: 'sdk'
       version: '8.x'
 
-  # 3) Restore
+  # 2) Restore
   - script: |
-      dotnet restore $(projectPath)
+      dotnet restore $(solutionPath)
     displayName: 'dotnet restore'
 
-  # 4) Build
+  # 3) Build
   - script: |
-      dotnet build $(projectPath) --configuration $(buildConfiguration) --no-restore
+      dotnet build $(solutionPath) --configuration $(buildConfiguration) --no-restore
     displayName: 'dotnet build'
 
-  # 5) Test (skip if no tests)
+  # 4) Test (will just say "0 tests" if you have none yet)
   - script: |
-      dotnet test $(projectPath) --configuration $(buildConfiguration) --no-build
+      dotnet test $(solutionPath) --configuration $(buildConfiguration) --no-build
     displayName: 'dotnet test'
 
-  # 6) Install Docker CLI
+  # 5) Install Docker CLI
   - task: DockerInstaller@0
     displayName: 'Install Docker CLI'
 
-  # 7) Docker Build
+  # 6) Docker Build
   - script: |
       docker build -t $(imageName):$(Build.BuildId) -f $(dockerfilePath) .
     displayName: 'Docker build image'
 
-  # 8) Save image to tar
+  # 7) Save image to tar
   - script: |
       mkdir -p $(Build.ArtifactStagingDirectory)/images
       docker save $(imageName):$(Build.BuildId) \
         -o $(Build.ArtifactStagingDirectory)/images/$(imageName)-$(Build.BuildId).tar
     displayName: 'Save Docker image as tar'
 
-  # 9) Copy K8s manifests
+  # 8) Copy K8s manifests
   - script: |
       mkdir -p $(Build.ArtifactStagingDirectory)/manifests
       cp k8s/k8s-sqskafka-config.yaml $(Build.ArtifactStagingDirectory)/manifests/
       cp k8s/k8s-sqskafka-deployment.yaml $(Build.ArtifactStagingDirectory)/manifests/
     displayName: 'Collect Kubernetes manifests'
 
-  # 10) Publish artifacts
+  # 9) Publish artifacts
   - task: PublishBuildArtifacts@1
     displayName: 'Publish build artifacts'
     inputs:
