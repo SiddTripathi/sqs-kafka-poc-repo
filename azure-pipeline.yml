@@ -1,0 +1,74 @@
+trigger:
+  branches:
+    include:
+      - master
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  imageName: 'sqs-to-kafka'
+  dockerfilePath: 'SqsToKafka/Dockerfile'   # <-- adjust if your Dockerfile path is different
+  projectPath: 'SqsToKafka'                 # <-- path to .csproj directory or solution dir
+  buildConfiguration: 'Release'
+
+steps:
+  # 1) Checkout code
+  - task: Checkout@1
+    displayName: 'Checkout code'
+    inputs:
+      clean: true
+
+  # 2) Install .NET SDK (8.x can build net6/net7 too)
+  - task: UseDotNet@2
+    displayName: 'Install .NET SDK'
+    inputs:
+      packageType: 'sdk'
+      version: '8.x'
+
+  # 3) Restore
+  - script: |
+      dotnet restore $(projectPath)
+    displayName: 'dotnet restore'
+
+  # 4) Build
+  - script: |
+      dotnet build $(projectPath) --configuration $(buildConfiguration) --no-restore
+    displayName: 'dotnet build'
+
+  # 5) Test (if you have test projects – adjust path or remove if none yet)
+  - script: |
+      dotnet test $(projectPath) --configuration $(buildConfiguration) --no-build
+    displayName: 'dotnet test'
+
+  # 6) Build Docker image
+  - task: DockerInstaller@0
+    displayName: 'Install Docker CLI'
+
+  - script: |
+      docker build -t $(imageName):$(Build.BuildId) -f $(dockerfilePath) .
+    displayName: 'Docker build image'
+
+  # 7) Save image as tar artifact for importing into K3s nodes
+  - script: |
+      mkdir -p $(Build.ArtifactStagingDirectory)/images
+      docker save $(imageName):$(Build.BuildId) \
+        -o $(Build.ArtifactStagingDirectory)/images/$(imageName)-$(Build.BuildId).tar
+    displayName: 'Docker save image to tar'
+
+  # 8) Copy K8s manifests into artifacts
+  - script: |
+      mkdir -p $(Build.ArtifactStagingDirectory)/manifests
+      cp k8s-sqskafka-config.yaml $(Build.ArtifactStagingDirectory)/manifests/
+      cp k8s-sqskafka-deployment.yaml $(Build.ArtifactStagingDirectory)/manifests/
+    displayName: 'Collect Kubernetes manifests'
+    # NOTE: adjust paths if these YAMLs live in a /k8s folder etc.
+
+  # 9) Publish all artifacts (image tar + manifests)
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish build artifacts'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+      ArtifactName: 'drop'
+      publishLocation: 'Container'
