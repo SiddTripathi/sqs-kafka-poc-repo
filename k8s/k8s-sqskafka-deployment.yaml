@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sqs-to-kafka
+  namespace: sqskafka
+  labels:
+    app: sqs-to-kafka
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sqs-to-kafka
+  template:
+    metadata:
+      labels:
+        app: sqs-to-kafka
+    spec:
+      containers:
+        - name: sqs-to-kafka
+          image: sqs-to-kafka:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: sqskafka-config
+            - secretRef:
+                name: sqskafka-secrets
+          env:
+            - name: DOTNET_ENVIRONMENT
+              value: "Development"
+          # optional but nice for stability
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      restartPolicy: Always
+

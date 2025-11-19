@@ -9,63 +9,59 @@ pool:
 
 variables:
   imageName: 'sqs-to-kafka'
-  dockerfilePath: 'SqsToKafka/Dockerfile'   # <-- adjust if your Dockerfile path is different
-  projectPath: 'SqsToKafka'                 # <-- path to .csproj directory or solution dir
+  dockerfilePath: 'SqsToKafka/Dockerfile'
+  solutionPath: 'SqsToKafka.sln'
   buildConfiguration: 'Release'
 
 steps:
-  # 1) Checkout code
-  - task: Checkout@1
-    displayName: 'Checkout code'
-    inputs:
-      clean: true
+  # (Implicit) checkout happens automatically â€“ no Checkout task needed
 
-  # 2) Install .NET SDK (8.x can build net6/net7 too)
+  # 1) Install .NET SDK
   - task: UseDotNet@2
     displayName: 'Install .NET SDK'
     inputs:
       packageType: 'sdk'
       version: '8.x'
 
-  # 3) Restore
+  # 2) Restore
   - script: |
-      dotnet restore $(projectPath)
+      dotnet restore $(solutionPath)
     displayName: 'dotnet restore'
 
-  # 4) Build
+  # 3) Build
   - script: |
-      dotnet build $(projectPath) --configuration $(buildConfiguration) --no-restore
+      dotnet build $(solutionPath) --configuration $(buildConfiguration) --no-restore
     displayName: 'dotnet build'
 
-  # 5) Test (if you have test projects – adjust path or remove if none yet)
+  # 4) Test (will just say "0 tests" if you have none yet)
   - script: |
-      dotnet test $(projectPath) --configuration $(buildConfiguration) --no-build
+      dotnet test $(solutionPath) --configuration $(buildConfiguration) --no-build
     displayName: 'dotnet test'
 
-  # 6) Build Docker image
+  # 5) Install Docker CLI
   - task: DockerInstaller@0
     displayName: 'Install Docker CLI'
 
+  # 6) Docker Build
   - script: |
       docker build -t $(imageName):$(Build.BuildId) -f $(dockerfilePath) .
     displayName: 'Docker build image'
 
-  # 7) Save image as tar artifact for importing into K3s nodes
+  # 7) Save image to tar
   - script: |
       mkdir -p $(Build.ArtifactStagingDirectory)/images
       docker save $(imageName):$(Build.BuildId) \
         -o $(Build.ArtifactStagingDirectory)/images/$(imageName)-$(Build.BuildId).tar
-    displayName: 'Docker save image to tar'
+    displayName: 'Save Docker image as tar'
 
-  # 8) Copy K8s manifests into artifacts
+  # 8) Copy K8s manifests
   - script: |
       mkdir -p $(Build.ArtifactStagingDirectory)/manifests
-      cp k8s-sqskafka-config.yaml $(Build.ArtifactStagingDirectory)/manifests/
-      cp k8s-sqskafka-deployment.yaml $(Build.ArtifactStagingDirectory)/manifests/
+      cp k8s/k8s-sqskafka-config.yaml $(Build.ArtifactStagingDirectory)/manifests/
+      cp k8s/k8s-sqskafka-deployment.yaml $(Build.ArtifactStagingDirectory)/manifests/
     displayName: 'Collect Kubernetes manifests'
-    # NOTE: adjust paths if these YAMLs live in a /k8s folder etc.
 
-  # 9) Publish all artifacts (image tar + manifests)
+  # 9) Publish artifacts
   - task: PublishBuildArtifacts@1
     displayName: 'Publish build artifacts'
     inputs:
