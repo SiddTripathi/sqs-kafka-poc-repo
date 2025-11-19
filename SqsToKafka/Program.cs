@@ -5,6 +5,7 @@ using SqsToKafka.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;                 // ValidateOnStart
 using SqsToKafka.Services.Dedup;
+using SqsToKafka.Replay;
 
 
 Host.CreateDefaultBuilder(args)
@@ -47,14 +48,26 @@ Host.CreateDefaultBuilder(args)
         services.AddOptions<DeadLetterOptions>()
                 .Bind(cfg.GetSection("DeadLetter"))
                 .ValidateOnStart();
+        // --- Replay (Blob recording) ----
+        services.AddOptions<ReplayOptions>()
+                .Bind(cfg.GetSection("Replay"))
+                .ValidateOnStart();
 
         // --- Services ----
         services.AddHostedService<SqsToKafkaWorker>();
         services.AddSingleton<IKafkaProducer, KafkaProducer>();
         services.AddSingleton<IDedupCache, InMemoryDedupCache>();
+        // Replay store (Blob-based)
+        services.AddSingleton<IReplayStore>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<ReplayOptions>>().Value;
+            return new BlobReplayStore(opts);
+        });
+
+
         services.AddSingleton<IDedupStore>(sp =>
         {
-            var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<DedupSqlOptions>>().Value;
+            var o = sp.GetRequiredService<IOptions<DedupSqlOptions>>().Value;
             if (o.Enabled && !string.IsNullOrWhiteSpace(o.ConnectionString))
                 return new SqlDedupStore(o.ConnectionString!, o.TtlDays);
 

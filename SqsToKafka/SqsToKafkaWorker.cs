@@ -6,10 +6,12 @@ using Amazon.SQS.Model;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using SqsToKafka.Replay;
 using SqsToKafka.Options;
 using SqsToKafka.Services;
 using SqsToKafka.Services.Dedup;
 using System.Text.Json;
+using System.Linq;
 
 
 
@@ -29,6 +31,7 @@ public class SqsToKafkaWorker : BackgroundService
     private readonly RetryOptions _retry;
     private readonly VisibilityOptions _vis;
     private readonly DeadLetterOptions _dlq;
+    private readonly IReplayStore _replay;
 
 
     public SqsToKafkaWorker(
@@ -42,7 +45,8 @@ public class SqsToKafkaWorker : BackgroundService
         IDedupStore dedupStore,
         IOptions<RetryOptions> retry,
         IOptions<VisibilityOptions> vis,
-        IOptions<DeadLetterOptions> dlq)
+        IOptions<DeadLetterOptions> dlq,
+        IReplayStore replayStore)
     {
         _logger = logger;
         _kafka = kafka.Value;
@@ -55,7 +59,7 @@ public class SqsToKafkaWorker : BackgroundService
         _retry = retry.Value;
         _vis = vis.Value;
         _dlq = dlq.Value;
-
+        _replay = replayStore;
 
         _logger.LogInformation(
          string.IsNullOrWhiteSpace(_sqs.Profile)
@@ -287,33 +291,6 @@ public class SqsToKafkaWorker : BackgroundService
                                 catch { /* non-JSON or missing — ignore */ }
                             }
 
-                            /* 
-                             * if (_dedup.TryAcquire(msg.MessageId, TimeSpan.FromSeconds(_dedupOpts.TtlSeconds)))
-                             //{
-                                 _logger.LogWarning("[Dedup] Duplicate message skipped: {Id}", msg.MessageId);
-                                 continue;
-                             //}
-
-
-                             MessageAttributeValue topicAttr = null!;
-                             MessageAttributeValue keyAttr = null!;
-
-                             if (msg.MessageAttributes != null)
-                             {
-                                 msg.MessageAttributes.TryGetValue("KafkaTopic", out topicAttr);
-                                 msg.MessageAttributes.TryGetValue("KafkaKey", out keyAttr);
-                             }
-
-                             var topic1 = string.IsNullOrWhiteSpace(topicAttr?.StringValue)
-                                 ? _kafka.DefaultTopic
-                                 : topicAttr.StringValue;
-
-                             var key1 = keyAttr?.StringValue;
-
-                             var (topic, key) = ResolveRouting(msg);
-
-                             */
-
                             if (await _dedupStore.SeenBeforeAsync(dedupId, stoppingToken))
                             {
                                 _logger.LogWarning("[Dedup:SQL] Already processed DedupId={DedupId} — deleting redelivery.", dedupId);
@@ -335,12 +312,59 @@ public class SqsToKafkaWorker : BackgroundService
                                 }
                             }
                             var (topic, key) = ResolveRouting(msg);
+                            //-----Replay Logic -------------
+
+                            string? eventType = null;
+                            try
+                            {
+                                using var bodyDoc = JsonDocument.Parse(msg.Body);
+                                if (bodyDoc.RootElement.ValueKind == JsonValueKind.Object &&
+                                    bodyDoc.RootElement.TryGetProperty("event", out var evProp) &&
+                                    evProp.ValueKind == JsonValueKind.String)
+                                {
+                                    eventType = evProp.GetString();
+                                }
+                            }
+                            catch
+                            {
+                                // Non-JSON body is fine; eventType stays null
+                            }
+
+                            var replayRecord = new ReplayRecord
+                            {
+                                Environment = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "unknown",
+                                RecordedAtUtc = DateTime.UtcNow,
+                                Source = "sqs-to-kafka-worker",
+                                PodName = null,   // we can wire K8s info later if needed
+                                NodeName = null,
+
+                                SqsMessageId = msg.MessageId,
+                                SqsReceiptHandle = msg.ReceiptHandle,
+                                SqsAttributes = msg.Attributes,
+                                MessageAttributes = msg.MessageAttributes?
+                                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value.StringValue ?? string.Empty),
+
+                                BodyJson = msg.Body,
+                                EventType = eventType,
+                                DedupId = dedupId,
+                                KafkaKey = key,
+
+                                TargetTopic = topic,
+                                DefaultTopic = _kafka.DefaultTopic,
+                                DlqTopic = _dlq.Topic,
+                                Status = ReplayStatus.Processed
+                            };
+
+                            await _replay.RecordAsync(replayRecord, stoppingToken);
+
+                            //-------End Replay-----
+
                             var attempt = 0;
                             //Exception? lastError = null;
                             var produced = false;
                             // Start auto-renewal of visibility while processing this message
                             using var visLease = StartVisibilityAutoExtend(sqsClient, _sqs.QueueUrl, msg.ReceiptHandle, stoppingToken);
-                            //The below line is for test only to test the extended visibility feature. 
+                            //The below line is for test only to test the extended visibility feature locally. 
                             //await Task.Delay(TimeSpan.FromSeconds(90), stoppingToken);
 
                             while (attempt < _retry.MaxProduceAttempts && !stoppingToken.IsCancellationRequested)
